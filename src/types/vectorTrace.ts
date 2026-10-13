@@ -89,7 +89,7 @@ export interface TraceStats {
   curveCount: number
   lineCount: number
   /** Detected geometric primitives (straight edges, arcs, full circles). */
-  primitives: { lines: number; arcs: number; circles: number }
+  primitives: { lines: number; arcs: number; circles: number; ellipses: number }
 }
 
 export interface TraceResult {

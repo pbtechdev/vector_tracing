@@ -32,6 +32,8 @@ export interface CenterlineResult {
   medianWidth: number
   skeletonPixels: number
   junctionCount: number
+  /** Distance (processing px) from a point to the nearest background pixel; 0 outside the ink. */
+  radiusAt: (p: Point) => number
 }
 
 interface GNode {
@@ -116,6 +118,17 @@ export function extractCenterlines(bitmap: Bitmap, opts: CenterlineOptions): Cen
     const i = indexAt(p)
     const r = i >= 0 ? dt[i] : 0
     return Number.isFinite(r) ? r : 0
+  }
+  /** Bilinear ink depth between pixel centres. */
+  const depthAt = (p: Point): number => {
+    const fx = p.x - 0.5
+    const fy = p.y - 0.5
+    const x0 = Math.floor(fx)
+    const y0 = Math.floor(fy)
+    const tx = fx - x0
+    const ty = fy - y0
+    const at = (x: number, y: number): number => radiusAt({ x: x + 0.5, y: y + 0.5 })
+    return (1 - ty) * ((1 - tx) * at(x0, y0) + tx * at(x0 + 1, y0)) + ty * ((1 - tx) * at(x0, y0 + 1) + tx * at(x0 + 1, y0 + 1))
   }
 
   const pixels: number[] = []
@@ -438,7 +451,10 @@ export function extractCenterlines(bitmap: Bitmap, opts: CenterlineOptions): Cen
   const walk = (startEdge: number, startEnd: 0 | 1): Chain => {
     const startNode = startEnd === 0 ? edges[startEdge].a : edges[startEdge].b
     const points: Point[] = [{ ...nodePt(startNode) }]
-    const fixed: number[] = [0]
+    // Only real junctions are pinned; a node left with two edges (e.g. after spur pruning) is
+    // just a point on the stroke.
+    const isJunction = (node: number): boolean => degreeOf(node) >= 3
+    const fixed: number[] = isJunction(startNode) ? [0] : []
     let eid = startEdge
     let from: 0 | 1 = startEnd
     let closed = false
@@ -447,9 +463,9 @@ export function extractCenterlines(bitmap: Bitmap, opts: CenterlineOptions): Cen
       usedEdge[eid] = 1
       const p = oriented(eid, from)
       for (let k = 1; k < p.length; k++) points.push({ ...p[k] })
-      fixed.push(points.length - 1)
       const toEnd = (1 - from) as 0 | 1
       lastNode = toEnd === 0 ? edges[eid].a : edges[eid].b
+      if (isJunction(lastNode)) fixed.push(points.length - 1)
       const nxt = partner[eid * 2 + toEnd]
       if (nxt < 0) break
       const nEdge = nxt >> 1
@@ -462,7 +478,7 @@ export function extractCenterlines(bitmap: Bitmap, opts: CenterlineOptions): Cen
     }
     if (closed && points.length > 1 && dist(points[0], points[points.length - 1]) < 1e-6) {
       points.pop()
-      fixed.pop()
+      while (fixed.length > 0 && fixed[fixed.length - 1] >= points.length) fixed.pop()
     }
     return {
       points,
@@ -548,5 +564,6 @@ export function extractCenterlines(bitmap: Bitmap, opts: CenterlineOptions): Cen
     medianWidth: Math.max(1, skelWidths.length ? median(skelWidths) : median(allWidths)),
     skeletonPixels: pixels.length,
     junctionCount,
+    radiusAt: depthAt,
   }
 }

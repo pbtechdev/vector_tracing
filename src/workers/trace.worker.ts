@@ -47,7 +47,8 @@ scope.onmessage = async (event) => {
     } else if (req.sharpenSkipped) {
       sharpen = { applied: false, reason: req.sharpenSkipped, durationMs: 0, tiles: 0, skippedTiles: 0 }
     }
-    const result = traceRaster({ raster, sourceWidth: req.sourceWidth, sourceHeight: req.sourceHeight, settings }, (p) =>
+    const detailScale = sharpen?.applied ? 1 : undefined
+    const result = traceRaster({ raster, sourceWidth: req.sourceWidth, sourceHeight: req.sourceHeight, settings, detailScale }, (p) =>
       scope.postMessage({ type: 'progress', id: req.id, progress: sharpen?.applied ? { ...p, fraction: 0.9 + 0.1 * p.fraction } : p }),
     )
     result.sharpen = sharpen

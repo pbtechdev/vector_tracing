@@ -1,5 +1,6 @@
 import type { PathSegment, Point, SubPath } from '../types/vectorTrace'
 import { type Polyline, detectCorners, fitBezierPath, taubinSmooth } from './curveFitting'
+import { ellipseDistance, ellipsePath, fitEllipse } from './ellipse'
 
 /**
  * Geometric primitive segmentation: every stretch of a polyline is classified as a straight
@@ -37,6 +38,10 @@ export interface PrimitiveOptions {
   minRadius: number
   /** Length (px) ignored at each end of a line fit, where neighbouring corners bend the data. */
   endTrim: number
+  /** Half the stroke width for centerlines; 0 for contours. */
+  strokeRadius: number
+  /** Ink depth lookup (centerlines): distance from a point to the nearest background pixel. */
+  radiusAt?: (p: Point) => number
   /** Free-curve fitting. */
   smoothing: number
   /** Taubin passes applied to free stretches before corner detection. */
@@ -51,6 +56,7 @@ export interface PrimitiveCounts {
   lines: number
   arcs: number
   circles: number
+  ellipses: number
 }
 
 const MIN_ARC_SWEEP = (20 * Math.PI) / 180
@@ -61,6 +67,11 @@ const POLYGON_TURN = (35 * Math.PI) / 180
 const LINE_ANCHOR_TURN = (40 * Math.PI) / 180
 const BENT_LINE_TURN = (10 * Math.PI) / 180
 const SHORT_LINE_CORNER = (50 * Math.PI) / 180
+const AXIS_SNAP = (2 * Math.PI) / 180
+/** Flatter loops are slots or bars, better described by lines and arcs. */
+const MAX_ELLIPSE_RATIO = 6
+/** Fillets of one shape whose radii agree within this ratio are given one common radius. */
+const FILLET_RADIUS_RATIO = 1.2
 const KAPPA_QUARTER = (4 / 3) * Math.tan(Math.PI / 8)
 
 const sub = (a: Point, b: Point): Point => ({ x: a.x - b.x, y: a.y - b.y })
@@ -471,7 +482,11 @@ function demoteFlatLines(pieces: Piece[], pts: Point[], closed: boolean, fixed: 
     const nb = at(k + step)
     if (!nb || nb === p) return 0
     const dir = { x: p.fit.dx, y: p.fit.dy }
-    if (nb.kind === 'line' && turnAngle(dir, { x: nb.fit.dx, y: nb.fit.dy }) >= LINE_ANCHOR_TURN) return 0
+    if (nb.kind === 'line') {
+      const t = turnAngle(dir, { x: nb.fit.dx, y: nb.fit.dy })
+      // A corner, or the same edge continuing (e.g. across the seam of a closed path).
+      if (t >= LINE_ANCHOR_TURN || t < 2 * LINE_CORNER_TURN) return 0
+    }
     if (nb.kind === 'arc' && turnAngle(dir, tangentAt(nb, pts[idx], pts, side === 'start')) >= SMOOTH_TURN) return 0
     if (nb.kind === 'free' && cum[nb.b] - cum[nb.a] <= opts.maxGap && at(k + 2 * step)?.kind === 'line') return 0
     const want = Math.max(3, Math.ceil((p.b - p.a) / 2))
@@ -760,6 +775,384 @@ function absorbGaps(pieces: Piece[], pts: Point[], fixed: Set<number>, opts: Pri
   })
 }
 
+/**
+ * Joins two collinear edges separated by a short bump (a junction where a branch leaves a
+ * centerline, or a speck on an outline) into one edge. The bump may deviate by about a stroke
+ * radius on centerlines, but only by the normal tolerance on outlines.
+ */
+function mergeAcrossBumps(pieces: Piece[], pts: Point[], fixed: Set<number>, opts: PrimitiveOptions, cum: Float64Array): Piece[] {
+  const tol = opts.tolerance
+  const bump = opts.strokeRadius > 0 ? tol + opts.strokeRadius : 1.5 * tol
+  const cut = 2 * opts.strokeRadius
+  const maxLen = 2 * opts.maxGap + 2 * cut
+  const out: Piece[] = []
+  for (const p of pieces) {
+    const A = out[out.length - 1]
+    if (p.kind !== 'line' || !A) {
+      out.push(p)
+      continue
+    }
+    // Walk back over short pieces (curves or short tilted lines) to a collinear line; the
+    // farthest one first, so a tilted piece of the bump never claims the edge.
+    const cands: number[] = []
+    let gapLen = 0
+    for (let k = out.length - 1; k >= 0; k--) {
+      if (k < out.length - 1) gapLen += cum[out[k + 1].b] - cum[out[k + 1].a]
+      if (gapLen > maxLen || fixed.has(out[k].b)) break
+      cands.push(k)
+    }
+    let merged = false
+    for (const k of cands.reverse()) {
+      const L = out[k]
+      if (L.kind !== 'line' || L.b > p.a) continue
+      if (L.fit.dx * p.fit.dx + L.fit.dy * p.fit.dy < Math.cos(2 * LINE_CORNER_TURN)) continue
+      // The edge ends next to the bump already lean into it; hold them to the bump limit only.
+      let la = L.b
+      while (la > L.a && cum[L.b] - cum[la] < cut) la--
+      let pb = p.a
+      while (pb < p.b && cum[pb] - cum[p.a] < cut) pb++
+      if (cum[la] - cum[L.a] < opts.minLength || cum[p.b] - cum[pb] < opts.minLength) continue
+      // Outer ends are left out of the fit: they pick up the rounding of the corners beyond.
+      const ta = Math.round(0.1 * (la - L.a))
+      const tb = Math.round(0.1 * (p.b - pb))
+      const edgePts = [...pts.slice(L.a + ta, la + 1), ...pts.slice(pb, p.b + 1 - tb)]
+      let fit = fitLine(edgePts)
+      if (fit.dx * (pts[p.b].x - pts[L.a].x) + fit.dy * (pts[p.b].y - pts[L.a].y) < 0) fit = { ...fit, dx: -fit.dx, dy: -fit.dy }
+      fit = snapToAxis(fit, pts, L.a, p.b, tol)
+      // Each edge must sit on the joint line about as well as on its own (it may already hold an
+      // absorbed bump of its own).
+      const limA = Math.max(1.5 * tol, lineDeviation(pts, L.a + ta, la, L.fit) + 0.5 * tol)
+      const limB = Math.max(1.5 * tol, lineDeviation(pts, pb, p.b - tb, p.fit) + 0.5 * tol)
+      if (lineDeviation(pts, L.a + ta, la, fit) > limA || lineDeviation(pts, pb, p.b - tb, fit) > limB) continue
+      if (lineDeviation(pts, la, pb, fit) > bump) continue
+      // Outer ends run into the neighbouring corners, whose rasterised apex is clipped.
+      const endLim = Math.max(bump, 2.5 * tol)
+      if (lineDeviation(pts, L.a, L.a + ta, fit) > endLim || lineDeviation(pts, p.b - tb, p.b, fit) > endLim) continue
+      out.length = k
+      out.push({ kind: 'line', a: L.a, b: p.b, fit })
+      merged = true
+      break
+    }
+    if (!merged) out.push(p)
+  }
+  return out
+}
+
+interface CornerFit {
+  r: number
+  err: number
+  /** Mean squared error of the window samples nearest the fillet arc (or corner). */
+  arcRms: number
+  P: Point
+  T1: Point
+  T2: Point
+  C: Point
+}
+
+/**
+ * Best corner between two straight edges: a circle tangent to both (radius r ≥ 0, r = 0 being a
+ * sharp corner), fitted to the samples around the corner. Edges eaten into the rounding by the
+ * greedy segmentation do not matter: only the fitted lines and the raw samples are used.
+ */
+/**
+ * Turns a line within AXIS_SNAP of horizontal or vertical exactly onto that axis (about its
+ * centroid), provided its samples still fit: drawn rectangles and frames come out square, while a
+ * genuinely tilted long edge drifts out of tolerance and keeps its angle.
+ */
+function snapToAxis(fit: LineFit, pts: Point[], a: number, b: number, tol: number): LineFit {
+  const ax = Math.abs(fit.dx) >= Math.abs(fit.dy) ? { x: Math.sign(fit.dx), y: 0 } : { x: 0, y: Math.sign(fit.dy) }
+  if (ax.x === 0 && ax.y === 0) return fit
+  if (Math.abs(fit.dx * ax.y - fit.dy * ax.x) > Math.sin(AXIS_SNAP)) return fit
+  if (ax.x === fit.dx && ax.y === fit.dy) return fit
+  const snapped = { cx: fit.cx, cy: fit.cy, dx: ax.x, dy: ax.y }
+  const limit = Math.max(tol, lineDeviation(pts, a, b, fit) + 0.25 * tol)
+  return lineDeviation(pts, a, b, snapped) <= limit ? snapped : fit
+}
+
+function fitCorner(A: LineFit, B: LineFit, pts: Point[], i0: number, i1: number, dmax: number, forceR?: number): CornerFit | null {
+  const dA = { x: A.dx, y: A.dy }
+  const dB = { x: B.dx, y: B.dy }
+  const P = intersect({ x: A.cx, y: A.cy }, dA, { x: B.cx, y: B.cy }, dB)
+  if (!P) return null
+  const turn = turnAngle(dA, dB)
+  const h = (Math.PI - turn) / 2
+  const inward = unit(sub(dB, dA))
+  const far = dmax * 4 + 10
+  const segDist = (q: Point, a: Point, b: Point): number => {
+    const ab = sub(b, a)
+    const l2 = dot(ab, ab)
+    const t = l2 < 1e-12 ? 0 : Math.max(0, Math.min(1, dot(sub(q, a), ab) / l2))
+    return Math.hypot(q.x - a.x - ab.x * t, q.y - a.y - ab.y * t)
+  }
+  const model = (r: number) => {
+    const d = r / Math.tan(h)
+    const T1 = { x: P.x - dA.x * d, y: P.y - dA.y * d }
+    const T2 = { x: P.x + dB.x * d, y: P.y + dB.y * d }
+    const C = { x: P.x + inward.x * (r / Math.sin(h)), y: P.y + inward.y * (r / Math.sin(h)) }
+    const A0 = { x: P.x - dA.x * far, y: P.y - dA.y * far }
+    const B1 = { x: P.x + dB.x * far, y: P.y + dB.y * far }
+    const v1 = sub(T1, C)
+    const v2 = sub(T2, C)
+    const span = Math.abs(Math.atan2(cross(v1, v2), dot(v1, v2)))
+    return { T1, T2, C, dist: (q: Point): { d: number; onArc: boolean } => {
+      const dl = Math.min(segDist(q, A0, T1), segDist(q, T2, B1))
+      if (r <= 1e-9) return { d: dl, onArc: false }
+      const v = sub(q, C)
+      const a1 = Math.abs(Math.atan2(cross(v1, v), dot(v1, v)))
+      const a2 = Math.abs(Math.atan2(cross(v, v2), dot(v, v2)))
+      if (a1 + a2 <= span + 1e-6) {
+        const da = Math.abs(Math.hypot(v.x, v.y) - r)
+        return da < dl ? { d: da, onArc: true } : { d: dl, onArc: false }
+      }
+      return { d: dl, onArc: false }
+    } }
+  }
+  const errOf = (r: number): number => {
+    const m = model(r)
+    let e = 0
+    for (let i = i0; i <= i1; i++) e += m.dist(pts[i]).d ** 2
+    return e
+  }
+  const rMax = Math.max(0, dmax * Math.tan(h))
+  let finalR: number
+  let finalE: number
+  if (forceR !== undefined) {
+    if (forceR > rMax) return null
+    finalR = forceR
+    finalE = errOf(forceR)
+  } else {
+    const steps = 48
+    let bestR = 0
+    let bestE = errOf(0)
+    for (let s = 1; s <= steps; s++) {
+      const r = (rMax * s) / steps
+      const e = errOf(r)
+      if (e < bestE) {
+        bestE = e
+        bestR = r
+      }
+    }
+    let lo = Math.max(0, bestR - rMax / steps)
+    let hi = Math.min(rMax, bestR + rMax / steps)
+    for (let it = 0; it < 24; it++) {
+      const m1 = lo + (hi - lo) / 3
+      const m2 = hi - (hi - lo) / 3
+      if (errOf(m1) < errOf(m2)) hi = m2
+      else lo = m1
+    }
+    const r = (lo + hi) / 2
+    const e = errOf(r)
+    finalR = e < bestE ? r : bestR
+    finalE = Math.min(e, bestE)
+  }
+  const m = model(finalR)
+  let arcSq = 0
+  let arcN = 0
+  for (let i = i0; i <= i1; i++) {
+    const q = m.dist(pts[i])
+    if (q.onArc || finalR <= 1e-9) {
+      arcSq += q.d ** 2
+      arcN++
+    }
+  }
+  return { r: finalR, err: finalE, arcRms: arcN ? Math.sqrt(arcSq / arcN) : 0, P, T1: m.T1, T2: m.T2, C: m.C }
+}
+
+/**
+ * Re-solves every corner between two straight edges with `fitCorner`: the pieces in between
+ * (chamfer stubs, short free curves, mis-sized arcs) are replaced by an exact tangent fillet arc,
+ * or removed so the edges meet at a sharp corner.
+ */
+function fitCorners(pieces: Piece[], pts: Point[], fixed: Set<number>, opts: PrimitiveOptions, cum: Float64Array): Piece[] {
+  const tol = opts.tolerance
+  const lenOf = (p: Piece): number => cum[p.b] - cum[p.a]
+  const isEdge = (p: Piece | undefined): p is Extract<Piece, { kind: 'line' }> => p?.kind === 'line' && lenOf(p) >= 2 * opts.minLength
+  const dirOf = (p: Extract<Piece, { kind: 'line' }>): Point => ({ x: p.fit.dx, y: p.fit.dy })
+  const out: Piece[] = []
+  const corners: FilletRecord[] = []
+  let k = 0
+  while (k < pieces.length) {
+    const A = pieces[k]
+    if (!isEdge(A)) {
+      out.push(A)
+      k++
+      continue
+    }
+    // The next edge, past free curves and arcs; a short line is skipped only when it is a chamfer
+    // (shallow turns at both ends), never when it is a real edge such as a tooth top.
+    let j = k + 1
+    while (j < pieces.length && !isEdge(pieces[j])) {
+      const p = pieces[j]
+      if (p.kind === 'line') {
+        const prev = pieces[j - 1]
+        const next = pieces[j + 1]
+        const shallow = (q: Piece | undefined) => q?.kind !== 'line' || turnAngle(dirOf(q), dirOf(p)) < SHORT_LINE_CORNER
+        // Also a chamfer: a pixel stub whose neighbours meet right beside it (the flanks around a
+        // tooth top meet far away).
+        let stub = false
+        if (prev?.kind === 'line' && next?.kind === 'line') {
+          const X = intersect({ x: prev.fit.cx, y: prev.fit.cy }, dirOf(prev), { x: next.fit.cx, y: next.fit.cy }, dirOf(next))
+          const midP = { x: (pts[p.a].x + pts[p.b].x) / 2, y: (pts[p.a].y + pts[p.b].y) / 2 }
+          stub = !!X && dist(X, midP) <= Math.max(lenOf(p), 2 * tol)
+        }
+        if (!stub && (!shallow(prev) || !shallow(next))) break
+      }
+      j++
+    }
+    const B = pieces[j]
+    let ok = isEdge(B)
+    const between = ok ? cum[B.a] - cum[A.b] : 0
+    const maxBetween = 6 * opts.maxGap + Math.min(lenOf(A), ok ? lenOf(B) : 0)
+    if (ok && between > maxBetween) ok = false
+    if (ok) for (let i = A.b; i <= B.a; i++) if (fixed.has(i)) ok = false
+    const Bl = B as Extract<Piece, { kind: 'line' }>
+    if (ok && turnAngle({ x: A.fit.dx, y: A.fit.dy }, { x: Bl.fit.dx, y: Bl.fit.dy }) < MIN_ARC_SWEEP) ok = false
+    if (!ok) {
+      out.push(A)
+      k++
+      continue
+    }
+    // Window: the stretch between the edges plus the edge ends that may hide part of the rounding.
+    const reachA = Math.min(0.5 * lenOf(A), between + 2 * opts.maxGap)
+    const reachB = Math.min(0.5 * lenOf(Bl), between + 2 * opts.maxGap)
+    let i0 = A.b
+    while (i0 > A.a + 1 && cum[A.b] - cum[i0 - 1] <= reachA) i0--
+    let i1 = Bl.a
+    while (i1 < Bl.b - 1 && cum[i1 + 1] - cum[Bl.a] <= reachB) i1++
+    let fa = A.fit
+    let fb = Bl.fit
+    let fit: CornerFit | null = null
+    let cornerDmax = 0
+    for (let pass = 0; pass < 2; pass++) {
+      const P = intersect({ x: fa.cx, y: fa.cy }, { x: fa.dx, y: fa.dy }, { x: fb.cx, y: fb.cy }, { x: fb.dx, y: fb.dy })
+      if (!P) break
+      const dmax = Math.min(dot(sub(P, pts[A.a]), { x: fa.dx, y: fa.dy }) - 0.5 * lenOf(A), dot(sub(pts[Bl.b], P), { x: fb.dx, y: fb.dy }) - 0.5 * lenOf(Bl)) + between / 2
+      if (!(dmax > 0)) break
+      fit = fitCorner(fa, fb, pts, i0, i1, dmax)
+      cornerDmax = dmax
+      if (!fit) break
+      // Refit the edges without the corner samples, then solve again.
+      const cutA = nearestIndex(pts, A.a, A.b, fit.T1)
+      const cutB = nearestIndex(pts, Bl.a, Bl.b, fit.T2)
+      if (pass === 0 && cutA - A.a >= 4 && Bl.b - cutB >= 4) {
+        fa = opts.lines ? snapToAxis(fitLineTrimmed(pts, A.a, cutA, opts.endTrim), pts, A.a, cutA, tol) : fitLineTrimmed(pts, A.a, cutA, opts.endTrim)
+        fb = opts.lines ? snapToAxis(fitLineTrimmed(pts, cutB, Bl.b, opts.endTrim), pts, cutB, Bl.b, tol) : fitLineTrimmed(pts, cutB, Bl.b, opts.endTrim)
+      }
+    }
+    const turn = turnAngle({ x: fa.dx, y: fa.dy }, { x: fb.dx, y: fb.dy })
+    const innerDepth = (f: CornerFit): number => {
+      if (!opts.radiusAt) return 0
+      const inward = unit(sub({ x: fb.dx, y: fb.dy }, { x: fa.dx, y: fa.dy }))
+      const off = (opts.strokeRadius + 0.25) / Math.sin((Math.PI - turn) / 2)
+      return opts.radiusAt({ x: f.P.x + inward.x * off, y: f.P.y + inward.y * off })
+    }
+    let rounded = opts.arcs && !!fit && turn >= MIN_ARC_SWEEP && fit.r >= opts.minRadius && fit.arcRms <= 0.75 * tol
+    if (fit && rounded) {
+      // The edges' meeting point lies off a rounded corner but on (outlines) or deep inside
+      // (centerlines: about one stroke radius / sin(half-angle) from the background) a sharp one.
+      let miss = Infinity
+      for (let i = i0; i <= i1; i++) miss = Math.min(miss, dist(pts[i], fit.P))
+      // Centerlines: a fillet no larger than the stroke radius leaves the inside of the stroke
+      // sharp, and rasterised acute corners measure about that much.
+      if (opts.radiusAt && opts.strokeRadius > 0) rounded = miss >= tol && innerDepth(fit) >= 1.75 && fit.r >= 1.5 * opts.strokeRadius + 1
+      else rounded = miss >= 2.5 * tol
+    }
+    if (!fit || !rounded) {
+      // A sharp corner: whatever lies between the edges (a misfit arc, a free blob) goes, when the
+      // two edges alone explain it. Skeletons round sharp corners by about r_s / sin(half-angle).
+      const half = (Math.PI - turn) / 2
+      const sharpLim = opts.strokeRadius > 0 ? 2.5 * tol + opts.strokeRadius / Math.sin(half) : 2.5 * tol
+      const m = fit ? nearestIndex(pts, A.b, Bl.a, fit.P) : -1
+      let sharp = !!fit && j > k + 1 && m > A.a + 1 && m < Bl.b - 1
+      for (let i = A.b; sharp && i <= Bl.a; i++) {
+        const q = pts[i]
+        const d = Math.min(Math.abs(fa.dx * (q.y - fa.cy) - fa.dy * (q.x - fa.cx)), Math.abs(fb.dx * (q.y - fb.cy) - fb.dy * (q.x - fb.cx)))
+        if (d > sharpLim) sharp = false
+      }
+      if (!sharp) {
+        out.push(A)
+        k++
+        continue
+      }
+      out.push({ kind: 'line', a: A.a, b: m, fit: fa })
+      pieces = pieces.slice()
+      pieces[j] = { kind: 'line', a: m, b: Bl.b, fit: fb }
+      k = j
+      continue
+    }
+    const cutA = nearestIndex(pts, A.a + 2, Bl.b - 3, fit.T1)
+    const cutB = nearestIndex(pts, cutA + 1, Bl.b - 2, fit.T2)
+    const v = unit(sub(fit.T1, fit.C))
+    const dir = dot({ x: -v.y, y: v.x }, { x: fa.dx, y: fa.dy }) > 0 ? 1 : -1
+    out.push({ kind: 'line', a: A.a, b: cutA, fit: fa })
+    out.push({ kind: 'arc', a: cutA, b: cutB, fit: { cx: fit.C.x, cy: fit.C.y, r: fit.r }, dir })
+    corners.push({ arc: out.length - 1, fa, fb, i0, i1, dmax: cornerDmax, r: fit.r })
+    pieces = pieces.slice()
+    pieces[j] = { kind: 'line', a: cutB, b: Bl.b, fit: fb }
+    k = j
+  }
+  equaliseFillets(out, corners, pts, tol)
+  return out
+}
+
+interface FilletRecord {
+  /** Index of the fillet arc in the output; the edges are the pieces either side of it. */
+  arc: number
+  fa: LineFit
+  fb: LineFit
+  i0: number
+  i1: number
+  dmax: number
+  r: number
+}
+
+/**
+ * Drawn shapes repeat one corner radius (a rounded rectangle, a slot, a bracket); the separately
+ * measured fillets scatter by a pixel or two around it. Fillets of similar radius are re-solved at
+ * their mean radius wherever that still fits their samples.
+ */
+function equaliseFillets(out: Piece[], corners: FilletRecord[], pts: Point[], tol: number): void {
+  if (corners.length < 2) return
+  const sorted = [...corners].sort((a, b) => a.r - b.r)
+  const groups: FilletRecord[][] = []
+  for (const c of sorted) {
+    const g = groups[groups.length - 1]
+    if (g && c.r <= (g.reduce((s, x) => s + x.r, 0) / g.length) * FILLET_RADIUS_RATIO) g.push(c)
+    else groups.push([c])
+  }
+  for (const g of groups) {
+    if (g.length < 2) continue
+    const r = g.reduce((s, c) => s + c.r, 0) / g.length
+    for (const c of g) {
+      const before = out[c.arc - 1]
+      const after = out[c.arc + 1]
+      if (before?.kind !== 'line' || after?.kind !== 'line') continue
+      const fit = fitCorner(c.fa, c.fb, pts, c.i0, c.i1, c.dmax, r)
+      if (!fit || fit.arcRms > 0.75 * tol) continue
+      const cutA = nearestIndex(pts, before.a + 2, after.b - 3, fit.T1)
+      const cutB = nearestIndex(pts, cutA + 1, after.b - 2, fit.T2)
+      const arc = out[c.arc]
+      if (arc.kind !== 'arc') continue
+      out[c.arc - 1] = { ...before, b: cutA }
+      out[c.arc] = { ...arc, a: cutA, b: cutB, fit: { cx: fit.C.x, cy: fit.C.y, r } }
+      out[c.arc + 1] = { ...after, a: cutB }
+    }
+  }
+}
+
+function nearestIndex(pts: Point[], a: number, b: number, q: Point): number {
+  let best = a
+  let bd = Infinity
+  for (let i = a; i <= b; i++) {
+    const d = dist(pts[i], q)
+    if (d < bd) {
+      bd = d
+      best = i
+    }
+  }
+  return best
+}
+
 function computeJoin(x: Piece, y: Piece, pts: Point[], fixedIdx: number | null, hardFixed: boolean, reach: number, tol: number): Join {
   const qx = pts[x.b]
   const qy = pts[y.a]
@@ -926,6 +1319,19 @@ function circlePath(c: Circle): SubPath {
   return { start: { x: c.cx + c.r, y: c.cy }, segments: segs, closed: true }
 }
 
+/** A closed loop that is an ellipse within tolerance everywhere, as an exact ellipse path. */
+function wholeEllipse(pts: Point[], opts: PrimitiveOptions): SubPath | null {
+  const e = fitEllipse(pts)
+  if (!e || Math.min(e.a, e.b) < opts.minRadius || Math.max(e.a, e.b) > MAX_ELLIPSE_RATIO * Math.min(e.a, e.b)) return null
+  for (const p of pts) if (ellipseDistance(e, p) > opts.tolerance) return null
+  let area = 0
+  for (let i = 0; i < pts.length; i++) {
+    const q = pts[(i + 1) % pts.length]
+    area += pts[i].x * q.y - q.x * pts[i].y
+  }
+  return ellipsePath(e, area > 0)
+}
+
 /** Index of the sharpest turn, a good seam for a closed polyline. */
 function sharpestIndex(pts: Point[], span: number): number {
   const n = pts.length
@@ -950,7 +1356,9 @@ function sharpestIndex(pts: Point[], span: number): number {
 export function fitPrimitives(line: Polyline, closed: boolean, opts: PrimitiveOptions, counts?: PrimitiveCounts): SubPath | null {
   const n = line.points.length
   if (n < 4 || (!opts.lines && !opts.arcs)) return null
-  const pinnedIdx = line.pinned.flatMap((p, i) => (p && (closed || (i > 0 && i < n - 1)) ? [i] : []))
+  // Soft pins (centerline junctions) do not constrain the geometry: edges and arcs run straight
+  // through them, and the strokes that end there are snapped onto the result afterwards.
+  const pinnedIdx = opts.pinnedAreCorners ? line.pinned.flatMap((p, i) => (p && (closed || (i > 0 && i < n - 1)) ? [i] : [])) : []
 
   if (closed && opts.arcs && pinnedIdx.length === 0) {
     const whole = arcFits(line.points, 0, n - 1, opts.tolerance)
@@ -963,6 +1371,11 @@ export function fitPrimitives(line: Polyline, closed: boolean, opts: PrimitiveOp
         const path = circlePath(c)
         return whole.sweep < 0 ? reversePath(path) : path
       }
+    }
+    const ellipse = wholeEllipse(line.points, opts)
+    if (ellipse) {
+      if (counts) counts.ellipses++
+      return ellipse
     }
   }
 
@@ -987,10 +1400,17 @@ export function fitPrimitives(line: Polyline, closed: boolean, opts: PrimitiveOp
   const firstStart = closed ? (pinnedIdx.length > 0 ? pinnedIdx[0] : sharpestIndex(line.points, 3)) : 0
   build(firstStart)
   if (closed && pinnedIdx.length === 0) {
-    // Re-cut the loop at its sharpest line–line corner so no edge straddles the seam.
+    // Re-cut the loop in the middle of its longest edge, so every corner (and fillet) lies away
+    // from the seam; the two halves are merged again on output. Without a long edge, cut at the
+    // sharpest line–line corner so no edge straddles the seam.
+    let longest = -1
+    for (let k = 0; k < pieces.length; k++) {
+      const p = pieces[k]
+      if (p.kind === 'line' && cum[p.b] - cum[p.a] >= 4 * opts.minLength && (longest < 0 || cum[p.b] - cum[p.a] > cum[pieces[longest].b] - cum[pieces[longest].a])) longest = k
+    }
     let bestTurn = POLYGON_TURN
-    let seam = -1
-    for (let k = 0; k + 1 < pieces.length; k++) {
+    let seam = longest >= 0 ? Math.round((pieces[longest].a + pieces[longest].b) / 2) : -1
+    for (let k = 0; longest < 0 && k + 1 < pieces.length; k++) {
       const x = pieces[k]
       const y = pieces[k + 1]
       if (x.kind !== 'line' || y.kind !== 'line') continue
@@ -1018,6 +1438,12 @@ export function fitPrimitives(line: Polyline, closed: boolean, opts: PrimitiveOp
   pieces = demoteFlatLines(pieces, pts, closed, fixed, cum, opts)
   pieces = demoteFloatingArcs(pieces, pts, closed, fixed, opts.maxGap, cum)
   pieces = absorbGaps(pieces, pts, fixed, opts, cum, closed)
+  for (let before = -1; before !== pieces.length; ) {
+    before = pieces.length
+    pieces = mergeAcrossBumps(pieces, pts, fixed, opts, cum)
+  }
+  pieces = pieces.map((p) => (p.kind === 'line' ? { ...p, fit: snapToAxis(p.fit, pts, p.a, p.b, opts.tolerance) } : p))
+  pieces = fitCorners(pieces, pts, fixed, opts, cum)
   if (!pieces.some((p) => p.kind !== 'free')) return null
 
   const hard = opts.pinnedAreCorners
@@ -1053,7 +1479,22 @@ export function fitPrimitives(line: Polyline, closed: boolean, opts: PrimitiveOp
       emitFree(segments, pts, p.a, p.b, s, e, opts)
     }
   }
-  return { start: { ...startJoin.point }, segments, closed }
+  const path: SubPath = { start: { ...startJoin.point }, segments, closed }
+  const merged = mergeSeamLines(path)
+  if (merged !== path && counts) counts.lines--
+  return merged
+}
+
+/** A closed path that starts in the middle of a straight edge: restart it at that edge's end. */
+function mergeSeamLines(path: SubPath): SubPath {
+  const segs = path.segments
+  const n = segs.length
+  if (!path.closed || n < 3 || segs[0].type !== 'L' || segs[n - 1].type !== 'L') return path
+  const from = segs[n - 2].to
+  const a = sub(path.start, from)
+  const b = sub(segs[0].to, path.start)
+  if (Math.abs(cross(unit(a), unit(b))) > Math.sin(LINE_CORNER_TURN) || dot(a, b) <= 0) return path
+  return { start: { ...segs[0].to }, segments: [...segs.slice(1, n - 1), { type: 'L', to: { ...segs[0].to } }], closed: true }
 }
 
 function reversePath(path: SubPath): SubPath {

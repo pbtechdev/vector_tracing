@@ -486,6 +486,8 @@ export interface GeometryOptions {
   upscale: number
   /** Half the stroke width for centerlines; 0 for contours. */
   strokeRadius: number
+  /** Ink depth lookup (centerlines): distance from a point to the nearest background pixel. */
+  radiusAt?: (p: Point) => number
   counts?: PrimitiveCounts
 }
 
@@ -500,6 +502,8 @@ function primitiveOptions(opts: CurveOptions, g: GeometryOptions): PrimitiveOpti
     maxGap: Math.max(5 * u, 2.5 * r),
     minRadius: Math.max(1.5 * u, 0.5 * r),
     endTrim: r,
+    strokeRadius: r,
+    radiusAt: g.radiusAt,
     smoothing: opts.smoothing,
     presmooth: opts.presmooth ?? 0,
     cornerAngle: opts.cornerAngle,

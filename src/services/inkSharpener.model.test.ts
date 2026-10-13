@@ -78,7 +78,7 @@ describe('bundled ink sharpener model', () => {
     const plain = traceRaster({ raster, sourceWidth: 80, sourceHeight: 24, settings: s })
     const sharp = await sharpenRaster(sharpenInput(raster, s), raster.width, raster.height, infer)
     expect(sharp.raster.width).toBe(80 * SHARPEN_SCALE)
-    const ai = traceRaster({ raster: sharp.raster, sourceWidth: 80, sourceHeight: 24, settings: sharpenedTraceSettings(s) })
+    const ai = traceRaster({ raster: sharp.raster, sourceWidth: 80, sourceHeight: 24, settings: sharpenedTraceSettings(s), detailScale: 1 })
     if (process.env.DUMP) {
       const { writeGrayPng } = await import('../test/png')
       const g = (r: RasterInput) => Array.from({ length: r.width * r.height }, (_, i) => r.data[i * 4])

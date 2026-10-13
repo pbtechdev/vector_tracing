@@ -91,8 +91,8 @@ export function OutputPanel({ image, result, mode, stale, exportSettings, onExpo
                 />
               )}
               <Row
-                label="Edges / arcs / circles"
-                value={`${result.stats.primitives.lines.toLocaleString()} / ${result.stats.primitives.arcs.toLocaleString()} / ${result.stats.primitives.circles.toLocaleString()}`}
+                label="Edges / arcs / circles / ellipses"
+                value={`${result.stats.primitives.lines.toLocaleString()} / ${result.stats.primitives.arcs.toLocaleString()} / ${result.stats.primitives.circles.toLocaleString()} / ${result.stats.primitives.ellipses.toLocaleString()}`}
               />
               <Row label="Foreground" value={`${(result.foregroundRatio * 100).toFixed(1)}%`} />
               <Row label="Trace time" value={`${Math.round(result.durationMs)} ms`} />

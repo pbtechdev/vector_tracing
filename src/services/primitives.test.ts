@@ -210,6 +210,17 @@ describe('circles and arcs', () => {
     expect(wave.shapes.flatMap((s) => s.subpaths).reduce((n, p) => n + sharpNodes(p), 0)).toBeLessThanOrEqual(4)
   })
 
+  it('emits an ellipse as an exact ellipse in both modes', () => {
+    const ell = (x: number, y: number) => Math.hypot((x - 120) / 90, (y - 100) / 55)
+    for (const mode of ['outline', 'centerline'] as const) {
+      const result = trace(240, 200, (x, y) => (mode === 'outline' ? ell(x, y) <= 1 : Math.abs(ell(x, y) - 1) * 70 < 4), mode)
+      expect(result.stats.primitives.ellipses, mode).toBe(1)
+      const path = result.shapes[0].subpaths[0]
+      expect(path.segments.map((s) => s.type).join('')).toBe('CCCC')
+      for (const p of sampleSubPath(path)) expect(Math.abs(ell(p.x, p.y) - 1) * 55).toBeLessThan(0.8)
+    }
+  })
+
   it('does not turn an ellipse into corners', () => {
     const result = trace(240, 160, (x, y) => ((x - 120) / 90) ** 2 + ((y - 80) / 45) ** 2 < 1)
     const path = result.shapes[0].subpaths[0]
@@ -227,6 +238,75 @@ describe('circles and arcs', () => {
     for (const p of sampleSubPath(path)) {
       const e = Math.hypot((p.x - 120) / 90, (p.y - 80) / 45)
       expect(Math.abs(e - 1) * 45).toBeLessThan(1.2)
+    }
+  })
+})
+
+describe('shape regularisation', () => {
+  const poly = (n: number, cx: number, cy: number, r: number, rot = 0): Point[] =>
+    Array.from({ length: n }, (_, k) => ({ x: cx + r * Math.cos(rot + (k / n) * 2 * Math.PI), y: cy + r * Math.sin(rot + (k / n) * 2 * Math.PI) }))
+  const onPolygon = (P: Point[], hw: number) => (x: number, y: number) => P.some((v, i) => segDist({ x, y }, v, P[(i + 1) % P.length]) < hw)
+
+  /** Centerline of a 160×120 rounded rectangle at (40,40) with corner radius r. */
+  const roundedRectDist = (r: number) => (x: number, y: number) => {
+    const qx = Math.min(Math.max(x, 40 + r), 200 - r)
+    const qy = Math.min(Math.max(y, 40 + r), 160 - r)
+    if (qx === x || qy === y) return Math.min(Math.abs(x - 40), Math.abs(x - 200), Math.abs(y - 40), Math.abs(y - 160))
+    return Math.abs(Math.hypot(x - qx, y - qy) - r)
+  }
+
+  it('traces a rounded-rectangle stroke as four exact axis-aligned edges and four equal fillets', () => {
+    const d = roundedRectDist(16)
+    const result = trace(240, 200, (x, y) => x > 30 && x < 210 && y > 30 && y < 170 && d(x, y) < 4.5, 'centerline')
+    const path = result.shapes[0].subpaths[0]
+    expect(path.closed).toBe(true)
+    expect(result.stats.primitives.arcs).toBe(4)
+    const nodes = nodesOf(path)
+    const lines = path.segments.flatMap((s, k) => (s.type === 'L' ? [{ from: nodes[k], to: s.to }] : []))
+    expect(lines).toHaveLength(4)
+    for (const l of lines) expect(Math.min(Math.abs(l.to.x - l.from.x), Math.abs(l.to.y - l.from.y))).toBeLessThan(1e-9)
+    // Each 90° fillet spans |dx| = |dy| = r; all four share one radius.
+    const radii = path.segments.flatMap((s, k) => (s.type === 'C' ? [Math.abs(s.to.x - nodes[k].x)] : []))
+    expect(radii).toHaveLength(4)
+    for (const r of radii) expect(Math.abs(r - radii[0])).toBeLessThan(1e-6)
+    expect(Math.abs(radii[0] - 16)).toBeLessThan(2)
+    for (const p of sampleSubPath(path)) expect(d(p.x, p.y)).toBeLessThan(1)
+  })
+
+  it('runs edges straight through junctions and lands branch strokes on them', () => {
+    const d = roundedRectDist(16)
+    const leg = (x: number, y: number) => Math.abs(x - 100) < 4.5 && y > 155 && y < 196
+    const arm = (x: number, y: number) => segDist({ x, y }, { x: 40, y: 100 }, { x: 4, y: 130 }) < 4.5
+    const result = trace(240, 200, (x, y) => (x > 30 && x < 210 && y > 30 && y < 170 && d(x, y) < 4.5) || leg(x, y) || arm(x, y), 'centerline')
+    const paths = result.shapes.flatMap((s) => s.subpaths)
+    const loop = paths.find((p) => p.closed)!
+    expect(loop.segments.map((s) => s.type).join('').replace(/CC/g, 'C')).toMatch(/^(CL){4}$|^(LC){4}$/)
+    const open = paths.filter((p) => !p.closed)
+    expect(open).toHaveLength(2)
+    const loopNodes = nodesOf(loop)
+    const curvePts = sampleSubPath({ ...loop, segments: loop.segments.map((s) => (s.type === 'C' ? s : { type: 'L', to: s.to })) }, 400)
+    const toLoop = (e: Point) =>
+      Math.min(...loop.segments.map((s, k) => (s.type === 'L' ? segDist(e, loopNodes[k], s.to) : Infinity)), ...curvePts.map((q) => dist(e, q)))
+    for (const p of open) {
+      const ends = [p.start, p.segments[p.segments.length - 1].to]
+      expect(Math.min(...ends.map(toLoop))).toBeLessThan(0.05)
+    }
+  })
+
+  it('keeps polygons sharp with exactly one edge per side', () => {
+    const shapes: [string, Point[]][] = [
+      ['triangle', poly(3, 120, 105, 80, -Math.PI / 2)],
+      ['hexagon', poly(6, 120, 100, 75)],
+      ['rotated square', poly(4, 120, 100, 80, 0.3)],
+    ]
+    for (const [name, P] of shapes) {
+      for (const mode of ['outline', 'centerline'] as const) {
+        const result = trace(240, 200, mode === 'outline' ? (x, y) => pointInPolygon({ x, y }, P) : onPolygon(P, 4), mode)
+        const path = result.shapes[0].subpaths[0]
+        expect(path.segments.map((s) => s.type).join(''), `${name} ${mode}`).toBe('L'.repeat(P.length))
+        const misses = P.map((v) => Math.min(...nodesOf(path).map((n) => dist(n, v))))
+        expect(Math.max(...misses), `${name} ${mode}`).toBeLessThan(mode === 'outline' ? 1.2 : 2.5)
+      }
     }
   })
 })

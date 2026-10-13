@@ -71,13 +71,30 @@ mode each traced polyline is first segmented into geometric primitives (`primiti
 - **Circles and arcs** (*Fit circles & arcs*): algebraic (Kåsa) circle fit refined by Gauss–Newton.
   Holes and bores become exact circles (4 cubic quarter arcs); fillets become arcs that join edges
   tangentially. Arcs are exported as cubic Béziers of ≤ 90° each (max radial error ≈ 0.03 % of r).
+- **Corners, sharp or rounded**: every corner between two straight edges is re-solved with an exact
+  model: the two edge lines plus a tangent fillet arc whose radius is fitted to the samples. The
+  fillet is kept only with evidence. On outlines, the edges' meeting point must miss the bitmap. On
+  centerlines, the ink must stay deep just inside the meeting point, and the radius must clearly
+  exceed the stroke radius. Otherwise the corner becomes a sharp intersection. Rounded rectangles,
+  slots and brackets therefore come out as straight edges joined by true tangent arcs, with no
+  chamfer stubs or kinks.
+- **Whole shapes**: closed loops that fit an ellipse within tolerance become an exact ellipse
+  (4 cubic quarter arcs; direct least-squares ellipse fit). Polygons come out with exactly one edge
+  per side, rounded rectangles as 4 edges + 4 fillets, slots as 2 edges + 2 semicircles.
+- **Regularisation**: edges within 2° of horizontal or vertical are made exactly axis-aligned when the
+  samples still fit (a genuinely tilted edge drifts out of tolerance and keeps its angle). Fillets of
+  one shape with similar radii (within 20 %) get their common mean radius.
+- **Junctions (centerline)**: the skeleton bends toward every branch, which used to put a kink in the
+  edge at each junction. Edges and arcs now run straight through junctions: two collinear edges
+  separated by a short bump of about a stroke radius are fitted as one. Each stroke that ends at
+  another stroke is then snapped exactly onto its fitted geometry.
 - **Guards for organic artwork**: a shape is only called a polygon when a few sharp-turn lines explain
   it better than a circle; "lines" that are just flat stretches of a curve (ellipse ends) or that keep
   bending along their length are handed back to the free curve fit, and short lines must be anchored
   by hard corners at both ends. Everything else uses the regular Bézier fit.
 
-The *Edges / arcs / circles* row in the output panel shows what was detected. Turn both toggles off
-to get the previous pure-curve behaviour.
+The *Edges / arcs / circles / ellipses* row in the output panel shows what was detected. Turn both
+toggles off to get the previous pure-curve behaviour.
 
 ## How it works
 
@@ -92,7 +109,10 @@ All processing lives in `src/services` (pure TypeScript, no React) and runs in a
   arm-intersection refinement, Taubin smoothing (no shrinkage), Schneider least-squares cubic Bézier
   fitting, near-straight segments emitted as lines.
 - `primitives` — segmentation into straight edges, circular arcs and free curves; line/circle
-  intersections, tangent joins, exact circle output.
+  intersections, tangent joins, fillet/sharp corner solving, axis snapping, equal fillet radii,
+  exact circle output.
+- `ellipse` — direct least-squares ellipse fit, point-to-ellipse distance, exact ellipse paths.
+- `junctionSnap` — lands centerline stroke ends that meet another stroke exactly on its geometry.
 - `distanceTransform` — exact Euclidean distance transform (stroke radius per pixel).
 - `skeleton` — allocation-free Zhang–Suen thinning and staircase removal.
 - `centerline` — skeleton graph construction, pruning, junction merging, gap closing, stroke joining
@@ -113,8 +133,10 @@ small images are upscaled; geometry is always mapped back to the original pixel 
   axis rather than a meaningful line — use Outline or Silhouette for those. Variable-width strokes
   get one width per path, not a varying width along the path.
 - Very sharp tips (< ~40°) may be blunted by up to ~1–2 px because of pixel aliasing.
-- Primitive fitting recognises lines and circles only: ellipses, involute tooth flanks and splines are
-  fitted as free curves. Features only a few pixels across (e.g. 6 px tooth tops) are recovered to
+- Primitive fitting recognises lines, circular arcs, whole circles and whole ellipses; elliptical
+  arcs, involute tooth flanks and splines are fitted as free curves. Fillets smaller than about
+  1.5× the stroke radius are indistinguishable from a sharp corner in centerline mode and come out
+  sharp. Features only a few pixels across (e.g. 6 px tooth tops) are recovered to
   ~1–1.5 px; use a higher processing resolution or a larger scan for tighter results. In centerline
   mode, corners land within ~2 px because the thinned skeleton itself rounds them.
 - Small script lettering can still pick up a few extra corners with geometry on; turn the
