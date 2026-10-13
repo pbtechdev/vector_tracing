@@ -1,6 +1,7 @@
 import type { Point, RasterInput, SubPath, TraceProgress, TraceResult, TraceSettings, TraceStats, VectorShape } from '../types/vectorTrace'
 import { groupContours, traceContours } from './contourDetection'
-import { type CurveOptions, polylineToPath, scaleSubPath, staircaseToPolyline } from './curveFitting'
+import { type CurveOptions, polylineToPath, resample, scaleSubPath, staircaseToPolyline, taubinSmooth } from './curveFitting'
+import { fitMinimalPath } from './minimalCurve'
 import { preprocess } from './imagePreprocessing'
 import { extractCenterlines } from './centerline'
 import { type SnapStroke, snapStrokeEnds } from './junctionSnap'
@@ -42,6 +43,66 @@ export function computeStats(shapes: VectorShape[], primitives: PrimitiveCounts 
   return { shapeCount: shapes.length, subpathCount, nodeCount, curveCount, lineCount, primitives: { ...primitives } }
 }
 
+/**
+ * Whether a fitted centerline stays on its stroke: no stretch longer than a stroke radius may run
+ * off the ink. Stroke ends are exempt (they are extended to the tip). Hairlines are not checked,
+ * since there the tolerance alone can reach the edge of the ink.
+ */
+function followsInk(sub: SubPath, strokeRadius: number, radiusAt: (p: Point) => number): boolean {
+  if (strokeRadius < 1.5) return true
+  const step = 0.5
+  const minDepth = 0.25 * strokeRadius
+  const { samples } = flattenPath(sub, step)
+  const skip = sub.closed ? 0 : Math.ceil((2 * strokeRadius) / step)
+  let run = 0
+  for (let i = skip; i < samples.length - skip; i++) {
+    run = radiusAt(samples[i]) < minDepth ? run + step : 0
+    if (run > strokeRadius) return false
+  }
+  return true
+}
+
+/** Points every `step` along a path; `nodes[k]` is the sample index where segment k ends. */
+function flattenPath(sub: SubPath, step: number): { samples: Point[]; nodes: number[] } {
+  const samples: Point[] = [sub.start]
+  const nodes: number[] = []
+  let from = sub.start
+  for (const seg of sub.segments) {
+    const len = seg.type === 'L' ? Math.hypot(seg.to.x - from.x, seg.to.y - from.y) : Math.hypot(seg.c1.x - from.x, seg.c1.y - from.y) + Math.hypot(seg.c2.x - seg.c1.x, seg.c2.y - seg.c1.y) + Math.hypot(seg.to.x - seg.c2.x, seg.to.y - seg.c2.y)
+    const n = Math.max(1, Math.ceil(len / step))
+    for (let i = 1; i <= n; i++) {
+      const t = i / n
+      if (seg.type === 'L') samples.push({ x: from.x + (seg.to.x - from.x) * t, y: from.y + (seg.to.y - from.y) * t })
+      else {
+        const u = 1 - t
+        samples.push({
+          x: u * u * u * from.x + 3 * u * u * t * seg.c1.x + 3 * u * t * t * seg.c2.x + t * t * t * seg.to.x,
+          y: u * u * u * from.y + 3 * u * u * t * seg.c1.y + 3 * u * t * t * seg.c2.y + t * t * t * seg.to.y,
+        })
+      }
+    }
+    nodes.push(samples.length - 1)
+    from = seg.to
+  }
+  return { samples, nodes }
+}
+
+/**
+ * Fewest-node fits may stray this many stroke radii from the (jittery) skeleton, but must keep
+ * every point at least MINIMAL_DEPTH stroke radii deep in the ink.
+ */
+const MINIMAL_TOLERANCE = 1
+const MINIMAL_DEPTH = 0.45
+/** A stroke is redrawn with fewest nodes once free stretches reach this share of its recognised pieces. */
+const MOSTLY_FREE = 0.25
+
+function addCounts(into: PrimitiveCounts, from: PrimitiveCounts): void {
+  into.lines += from.lines
+  into.arcs += from.arcs
+  into.circles += from.circles
+  into.ellipses += from.ellipses
+}
+
 const now = (): number => (typeof performance !== 'undefined' ? performance.now() : Date.now())
 
 export function traceRaster(input: TraceInput, onProgress?: (p: TraceProgress) => void): TraceResult {
@@ -69,10 +130,9 @@ export function traceRaster(input: TraceInput, onProgress?: (p: TraceProgress) =
     spacing: 1.25 * upscale,
   }
   const counts: PrimitiveCounts = { lines: 0, arcs: 0, circles: 0, ellipses: 0 }
-  const geometry = (strokeRadius: number, radiusAt?: (p: Point) => number): CurveOptions['geometry'] =>
-    settings.straightEdges || settings.fitArcs
-      ? { lines: settings.straightEdges, arcs: settings.fitArcs, upscale, strokeRadius, radiusAt, counts }
-      : undefined
+  const useGeometry = settings.straightEdges || settings.fitArcs
+  const geometry = (strokeRadius: number, radiusAt?: (p: Point) => number, into: PrimitiveCounts = counts): CurveOptions['geometry'] =>
+    useGeometry ? { lines: settings.straightEdges, arcs: settings.fitArcs, upscale, strokeRadius, radiusAt, counts: into } : undefined
 
   const shapes: VectorShape[] = []
   let estimatedStrokeWidth = 1
@@ -95,7 +155,36 @@ export function traceRaster(input: TraceInput, onProgress?: (p: TraceProgress) =
     center.strokes.forEach((stroke, k) => {
       const fixed = new Set(stroke.fixed)
       const pinned = stroke.points.map((_, i) => fixed.has(i))
-      const sub = polylineToPath({ points: stroke.points, pinned }, stroke.closed, { ...lineOpts, geometry: geometry(stroke.width / 2, center.radiusAt) })
+      const line = { points: stroke.points, pinned }
+      const found: PrimitiveCounts = { lines: 0, arcs: 0, circles: 0, ellipses: 0 }
+      const r = stroke.width / 2
+      let sub = polylineToPath(line, stroke.closed, { ...lineOpts, geometry: geometry(r, center.radiusAt, found) })
+      // Every recognised shape is checked against the drawing; one that leaves the ink anywhere
+      // is replaced by the plain curve fit, which follows the ink.
+      let exact = true
+      if (sub && useGeometry && !followsInk(sub, r, center.radiusAt)) {
+        sub = polylineToPath(line, stroke.closed, lineOpts)
+        exact = false
+      }
+      const recognised = found.lines + found.arcs + found.circles + found.ellipses
+      if (exact && recognised > 0 && (found.free ?? 0) < MOSTLY_FREE * recognised) {
+        addCounts(counts, found)
+      } else if (useGeometry && sub) {
+        // Mostly freehand strokes get the fewest-node description that still stays on the ink,
+        // the way a person would redraw them; strokes made of exact lines, arcs and whole shapes are kept.
+        const tol = Math.max(0.6 * upscale, 0.6 + 0.12 * r, MINIMAL_TOLERANCE * r)
+        const sampled = taubinSmooth(resample(line, opts.spacing, stroke.closed), 3, stroke.closed)
+        const span = Math.max(2, Math.round(r / opts.spacing))
+        const ink = { depth: center.radiusAt, minDepth: MINIMAL_DEPTH * r, endClearance: 2 * r }
+        const simple = fitMinimalPath(sampled.points, stroke.closed, tol, span, span, ink, exact ? found.corners : [])
+        if (simple && simple.segments.length < sub.segments.length && followsInk(simple, r, center.radiusAt)) {
+          sub = simple
+        } else if (exact) {
+          addCounts(counts, found)
+        }
+      } else if (exact) {
+        addCounts(counts, found)
+      }
       if (sub) fitted.push({ sub, radius: stroke.width / 2, width: stroke.width })
       if (k % 200 === 0) report('Fitting curves', 0.6 + 0.35 * (k / Math.max(1, total)))
     })

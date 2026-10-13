@@ -88,6 +88,13 @@ mode each traced polyline is first segmented into geometric primitives (`primiti
   edge at each junction. Edges and arcs now run straight through junctions: two collinear edges
   separated by a short bump of about a stroke radius are fitted as one. Each stroke that ends at
   another stroke is then snapped exactly onto its fitted geometry.
+- **Fewest nodes (centerline)**: a stroke that is mostly freehand (free stretches reach a quarter of
+  its recognised lines and arcs) is redrawn the way a person uses the pen tool: as few nodes as
+  possible, each span one line, one circular arc or, if neither fits, one cubic. Every span must stay
+  in the ink (at least 0.45 stroke radii from its edge) and within one stroke radius of the
+  skeleton; corners already established from the ink keep their own node. Nodes land where a side
+  turns into a corner, and slightly bent joins are made smooth. Strokes built from exact geometry are
+  left as they are.
 - **Guards for organic artwork**: a shape is only called a polygon when a few sharp-turn lines explain
   it better than a circle; "lines" that are just flat stretches of a curve (ellipse ends) or that keep
   bending along their length are handed back to the free curve fit, and short lines must be anchored
@@ -112,6 +119,7 @@ All processing lives in `src/services` (pure TypeScript, no React) and runs in a
   intersections, tangent joins, fillet/sharp corner solving, axis snapping, equal fillet radii,
   exact circle output.
 - `ellipse` — direct least-squares ellipse fit, point-to-ellipse distance, exact ellipse paths.
+- `minimalCurve` — fewest-node line/arc/cubic fit of a stroke that stays on the ink.
 - `junctionSnap` — lands centerline stroke ends that meet another stroke exactly on its geometry.
 - `distanceTransform` — exact Euclidean distance transform (stroke radius per pixel).
 - `skeleton` — allocation-free Zhang–Suen thinning and staircase removal.

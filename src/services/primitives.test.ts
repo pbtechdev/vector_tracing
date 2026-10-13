@@ -245,6 +245,10 @@ describe('circles and arcs', () => {
 describe('shape regularisation', () => {
   const poly = (n: number, cx: number, cy: number, r: number, rot = 0): Point[] =>
     Array.from({ length: n }, (_, k) => ({ x: cx + r * Math.cos(rot + (k / n) * 2 * Math.PI), y: cy + r * Math.sin(rot + (k / n) * 2 * Math.PI) }))
+  const unitTo = (a: Point, b: Point): Point => {
+    const l = Math.hypot(b.x - a.x, b.y - a.y)
+    return { x: (b.x - a.x) / l, y: (b.y - a.y) / l }
+  }
   const onPolygon = (P: Point[], hw: number) => (x: number, y: number) => P.some((v, i) => segDist({ x, y }, v, P[(i + 1) % P.length]) < hw)
 
   /** Centerline of a 160×120 rounded rectangle at (40,40) with corner radius r. */
@@ -293,6 +297,33 @@ describe('shape regularisation', () => {
     }
   })
 
+  it('keeps a rounded acute tip rounded and a sharp one sharp', () => {
+    const V = [{ x: 210, y: 40 }, { x: 228, y: 290 }, { x: 60, y: 370 }]
+    // Centerline of the triangle with every corner rounded (apex r = 12).
+    const rounded: Point[] = []
+    V.forEach((P, i) => {
+      const r = [12, 30, 25][i]
+      const ua = unitTo(P, V[(i + 2) % 3])
+      const ub = unitTo(P, V[(i + 1) % 3])
+      const half = Math.acos(ua.x * ub.x + ua.y * ub.y) / 2
+      const bis = unitTo({ x: 0, y: 0 }, { x: ua.x + ub.x, y: ua.y + ub.y })
+      const C = { x: P.x + (bis.x * r) / Math.sin(half), y: P.y + (bis.y * r) / Math.sin(half) }
+      const d = r / Math.tan(half)
+      const a0 = Math.atan2(P.y + ua.y * d - C.y, P.x + ua.x * d - C.x)
+      let sweep = Math.atan2(P.y + ub.y * d - C.y, P.x + ub.x * d - C.x) - a0
+      while (sweep > Math.PI) sweep -= 2 * Math.PI
+      while (sweep < -Math.PI) sweep += 2 * Math.PI
+      for (let k = 0; k <= 40; k++) rounded.push({ x: C.x + r * Math.cos(a0 + (sweep * k) / 40), y: C.y + r * Math.sin(a0 + (sweep * k) / 40) })
+    })
+    const roundTrace = trace(300, 420, onPolygon(rounded, 4.5), 'centerline')
+    const roundPath = roundTrace.shapes[0].subpaths[0]
+    expect(roundTrace.stats.primitives.arcs).toBe(3)
+    for (const p of sampleSubPath(roundPath, 16)) expect(Math.min(...rounded.map((v, i) => segDist(p, v, rounded[(i + 1) % rounded.length])))).toBeLessThan(0.8)
+
+    const sharpTrace = trace(300, 420, onPolygon(V, 4.5), 'centerline')
+    expect(sharpTrace.shapes[0].subpaths[0].segments.map((s) => s.type).join('')).toBe('LLL')
+  })
+
   it('keeps polygons sharp with exactly one edge per side', () => {
     const shapes: [string, Point[]][] = [
       ['triangle', poly(3, 120, 105, 80, -Math.PI / 2)],
@@ -308,5 +339,37 @@ describe('shape regularisation', () => {
         expect(Math.max(...misses), `${name} ${mode}`).toBeLessThan(mode === 'outline' ? 1.2 : 2.5)
       }
     }
+  })
+})
+
+describe('fewest nodes', () => {
+  it('redraws a wobbly freehand loop with a handful of nodes that stay on the ink', () => {
+    // A rounded triangle drawn by hand: the pen wobbles a little all the way round.
+    const loop = (wobble: number): Point[] =>
+      Array.from({ length: 720 }, (_, k) => {
+        const t = (k / 720) * 2 * Math.PI
+        const r = 70 + 14 * Math.cos(3 * t) + wobble * Math.sin(29 * t)
+        return { x: 120 + r * Math.cos(t), y: 120 + r * Math.sin(t) }
+      })
+    const curve = loop(1.5)
+    const intended = loop(0)
+    const half = 5
+    const ink = (x: number, y: number) => {
+      for (let i = 0; i < curve.length; i++) if (segDist({ x, y }, curve[i], curve[(i + 1) % curve.length]) < half) return true
+      return false
+    }
+    const result = trace(240, 240, ink, 'centerline')
+    const path = result.shapes[0].subpaths[0]
+    expect(path.closed).toBe(true)
+    expect(path.segments.length).toBeLessThanOrEqual(8)
+    const far = (p: Point, c: Point[]) => Math.min(...c.map((q, i) => segDist(p, q, c[(i + 1) % c.length])))
+    let onInk = 0
+    let offIntent = 0
+    for (const p of sampleSubPath(path, 16)) {
+      onInk = Math.max(onInk, far(p, curve))
+      offIntent = Math.max(offIntent, far(p, intended))
+    }
+    expect(onInk).toBeLessThan(0.85 * half)
+    expect(offIntent).toBeLessThan(0.7 * half)
   })
 })

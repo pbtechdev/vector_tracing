@@ -57,6 +57,10 @@ export interface PrimitiveCounts {
   arcs: number
   circles: number
   ellipses: number
+  /** Stretches that matched no primitive and were emitted as free Béziers. */
+  free?: number
+  /** Corners between two recognised pieces. */
+  corners?: Point[]
 }
 
 const MIN_ARC_SWEEP = (20 * Math.PI) / 180
@@ -993,7 +997,10 @@ function fitCorners(pieces: Piece[], pts: Point[], fixed: Set<number>, opts: Pri
         if (prev?.kind === 'line' && next?.kind === 'line') {
           const X = intersect({ x: prev.fit.cx, y: prev.fit.cy }, dirOf(prev), { x: next.fit.cx, y: next.fit.cy }, dirOf(next))
           const midP = { x: (pts[p.a].x + pts[p.b].x) / 2, y: (pts[p.a].y + pts[p.b].y) / 2 }
-          stub = !!X && dist(X, midP) <= Math.max(lenOf(p), 2 * tol)
+          // Skeletons cut a corner off by about r_s / sin(half-angle) on top of that.
+          const half = (Math.PI - turnAngle(dirOf(prev), dirOf(next))) / 2
+          const skeletonCut = opts.strokeRadius > 0 ? opts.strokeRadius / Math.max(Math.sin(half), 0.2) : 0
+          stub = !!X && dist(X, midP) <= Math.max(lenOf(p), 2 * tol) + skeletonCut
         }
         if (!stub && (!shallow(prev) || !shallow(next))) break
       }
@@ -1047,15 +1054,18 @@ function fitCorners(pieces: Piece[], pts: Point[], fixed: Set<number>, opts: Pri
       return opts.radiusAt({ x: f.P.x + inward.x * off, y: f.P.y + inward.y * off })
     }
     let rounded = opts.arcs && !!fit && turn >= MIN_ARC_SWEEP && fit.r >= opts.minRadius && fit.arcRms <= 0.75 * tol
+    let miss = Infinity
+    if (fit) for (let i = i0; i <= i1; i++) miss = Math.min(miss, dist(pts[i], fit.P))
     if (fit && rounded) {
       // The edges' meeting point lies off a rounded corner but on (outlines) or deep inside
       // (centerlines: about one stroke radius / sin(half-angle) from the background) a sharp one.
-      let miss = Infinity
-      for (let i = i0; i <= i1; i++) miss = Math.min(miss, dist(pts[i], fit.P))
       // Centerlines: a fillet no larger than the stroke radius leaves the inside of the stroke
-      // sharp, and rasterised acute corners measure about that much.
-      if (opts.radiusAt && opts.strokeRadius > 0) rounded = miss >= tol && innerDepth(fit) >= 1.75 && fit.r >= 1.5 * opts.strokeRadius + 1
-      else rounded = miss >= 2.5 * tol
+      // sharp, and rasterised acute corners measure about that much. When the edges' meeting
+      // point is off the ink altogether, the stroke plainly turns before reaching it.
+      if (opts.radiusAt && opts.strokeRadius > 0) {
+        const offInk = opts.radiusAt(fit.P) < 0.5 * opts.strokeRadius
+        rounded = miss >= tol && fit.r >= 1.5 * opts.strokeRadius + 1 && (offInk || innerDepth(fit) >= 1.75)
+      } else rounded = miss >= 2.5 * tol
     }
     if (!fit || !rounded) {
       // A sharp corner: whatever lies between the edges (a misfit arc, a free blob) goes, when the
@@ -1064,6 +1074,9 @@ function fitCorners(pieces: Piece[], pts: Point[], fixed: Set<number>, opts: Pri
       const sharpLim = opts.strokeRadius > 0 ? 2.5 * tol + opts.strokeRadius / Math.sin(half) : 2.5 * tol
       const m = fit ? nearestIndex(pts, A.b, Bl.a, fit.P) : -1
       let sharp = !!fit && j > k + 1 && m > A.a + 1 && m < Bl.b - 1
+      // The sharp apex must exist in the drawing: on the ink for strokes, on the boundary for
+      // outlines. Otherwise the pieces that follow the ink are kept.
+      if (sharp && fit) sharp = opts.radiusAt && opts.strokeRadius > 0 ? opts.radiusAt(fit.P) >= 0.5 * opts.strokeRadius : miss <= 2.5 * tol
       for (let i = A.b; sharp && i <= Bl.a; i++) {
         const q = pts[i]
         const d = Math.min(Math.abs(fa.dx * (q.y - fa.cy) - fa.dy * (q.x - fa.cx)), Math.abs(fb.dx * (q.y - fb.cy) - fb.dy * (q.x - fb.cx)))
@@ -1455,7 +1468,9 @@ export function fitPrimitives(line: Polyline, closed: boolean, opts: PrimitiveOp
     const idx = x.b
     const atSeam = k === pieces.length - 1
     const fixedIdx = fixed.has(idx) && !atSeam ? idx : atSeam && fixed.has(m - 1) ? m - 1 : null
-    joins.push(computeJoin(x, y, pts, fixedIdx, hard, reach, opts.tolerance))
+    const join = computeJoin(x, y, pts, fixedIdx, hard, reach, opts.tolerance)
+    joins.push(join)
+    if (counts && !join.tangent && x.kind !== 'free' && y.kind !== 'free') (counts.corners ??= []).push({ ...join.point })
   }
 
   // joins[k] is between pieces[k] and pieces[k+1]; for closed paths the last wraps to the first.
@@ -1477,23 +1492,28 @@ export function fitPrimitives(line: Polyline, closed: boolean, opts: PrimitiveOp
       if (counts) counts.arcs++
     } else {
       emitFree(segments, pts, p.a, p.b, s, e, opts)
+      if (counts) counts.free = (counts.free ?? 0) + 1
     }
   }
   const path: SubPath = { start: { ...startJoin.point }, segments, closed }
-  const merged = mergeSeamLines(path)
+  const merged = mergeSeamLines(path, opts.tolerance)
   if (merged !== path && counts) counts.lines--
   return merged
 }
 
 /** A closed path that starts in the middle of a straight edge: restart it at that edge's end. */
-function mergeSeamLines(path: SubPath): SubPath {
+function mergeSeamLines(path: SubPath, tol: number): SubPath {
   const segs = path.segments
   const n = segs.length
   if (!path.closed || n < 3 || segs[0].type !== 'L' || segs[n - 1].type !== 'L') return path
   const from = segs[n - 2].to
   const a = sub(path.start, from)
   const b = sub(segs[0].to, path.start)
-  if (Math.abs(cross(unit(a), unit(b))) > Math.sin(LINE_CORNER_TURN) || dot(a, b) <= 0) return path
+  if (dot(a, b) <= 0) return path
+  // Collinear by angle, or (for a short stub) by the seam point's offset from the joint line.
+  const chord = sub(segs[0].to, from)
+  const offset = Math.abs(cross(unit(chord), a))
+  if (Math.abs(cross(unit(a), unit(b))) > Math.sin(LINE_CORNER_TURN) && offset > tol) return path
   return { start: { ...segs[0].to }, segments: [...segs.slice(1, n - 1), { type: 'L', to: { ...segs[0].to } }], closed: true }
 }
 
