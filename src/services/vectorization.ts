@@ -3,6 +3,7 @@ import { groupContours, traceContours } from './contourDetection'
 import { type CurveOptions, polylineToPath, scaleSubPath, staircaseToPolyline } from './curveFitting'
 import { preprocess } from './imagePreprocessing'
 import { extractCenterlines } from './centerline'
+import type { PrimitiveCounts } from './primitives'
 
 export interface TraceInput {
   raster: RasterInput
@@ -17,7 +18,7 @@ export function detailToTolerance(detail: number): number {
   return 0.2 + ((100 - d) / 100) * 2.8
 }
 
-export function computeStats(shapes: VectorShape[]): TraceStats {
+export function computeStats(shapes: VectorShape[], primitives: PrimitiveCounts = { lines: 0, arcs: 0, circles: 0 }): TraceStats {
   let subpathCount = 0
   let nodeCount = 0
   let curveCount = 0
@@ -32,7 +33,7 @@ export function computeStats(shapes: VectorShape[]): TraceStats {
       }
     }
   }
-  return { shapeCount: shapes.length, subpathCount, nodeCount, curveCount, lineCount }
+  return { shapeCount: shapes.length, subpathCount, nodeCount, curveCount, lineCount, primitives: { ...primitives } }
 }
 
 const now = (): number => (typeof performance !== 'undefined' ? performance.now() : Date.now())
@@ -61,6 +62,11 @@ export function traceRaster(input: TraceInput, onProgress?: (p: TraceProgress) =
     cornerAngle: settings.cornerAngle,
     spacing: 1.25 * upscale,
   }
+  const counts: PrimitiveCounts = { lines: 0, arcs: 0, circles: 0 }
+  const geometry = (strokeRadius: number): CurveOptions['geometry'] =>
+    settings.straightEdges || settings.fitArcs
+      ? { lines: settings.straightEdges, arcs: settings.fitArcs, upscale, strokeRadius, counts }
+      : undefined
 
   const shapes: VectorShape[] = []
   let estimatedStrokeWidth = 1
@@ -82,7 +88,7 @@ export function traceRaster(input: TraceInput, onProgress?: (p: TraceProgress) =
     center.strokes.forEach((stroke, k) => {
       const fixed = new Set(stroke.fixed)
       const pinned = stroke.points.map((_, i) => fixed.has(i))
-      const sub = polylineToPath({ points: stroke.points, pinned }, stroke.closed, lineOpts)
+      const sub = polylineToPath({ points: stroke.points, pinned }, stroke.closed, { ...lineOpts, geometry: geometry(stroke.width / 2) })
       if (sub) shapes.push({ kind: 'stroke', subpaths: [scaleSubPath(sub, sx, sy)], strokeWidth: stroke.width * sx })
       if (k % 200 === 0) report('Fitting curves', 0.6 + 0.35 * (k / Math.max(1, total)))
     })
@@ -92,12 +98,13 @@ export function traceRaster(input: TraceInput, onProgress?: (p: TraceProgress) =
     const groups = groupContours(contours)
     report('Fitting curves', 0.45)
     const cornerRun = Math.max(3, Math.round(3 * upscale))
+    const contourOpts: CurveOptions = { ...opts, geometry: geometry(0) }
     const total = groups.length
     for (let g = 0; g < total; g++) {
       const group = groups[g]
       const subpaths: SubPath[] = []
       for (const c of [group.outer, ...group.holes]) {
-        const sub = polylineToPath(staircaseToPolyline(c.points, cornerRun), true, opts)
+        const sub = polylineToPath(staircaseToPolyline(c.points, cornerRun), true, contourOpts)
         if (sub) subpaths.push(scaleSubPath(sub, sx, sy))
       }
       if (subpaths.length > 0) shapes.push({ kind: 'area', subpaths })
@@ -117,7 +124,7 @@ export function traceRaster(input: TraceInput, onProgress?: (p: TraceProgress) =
     processingWidth: raster.width,
     processingHeight: raster.height,
     shapes,
-    stats: computeStats(shapes),
+    stats: computeStats(shapes, counts),
     thresholdUsed: pre.thresholdUsed,
     foregroundRatio: pre.foregroundRatio,
     estimatedStrokeWidth,

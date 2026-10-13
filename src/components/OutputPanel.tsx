@@ -84,6 +84,16 @@ export function OutputPanel({ image, result, mode, stale, exportSettings, onExpo
               )}
               <Row label="Nodes" value={result.stats.nodeCount.toLocaleString()} />
               <Row label="Curves / lines" value={`${result.stats.curveCount.toLocaleString()} / ${result.stats.lineCount.toLocaleString()}`} />
+              {result.sharpen && (
+                <Row
+                  label="AI sharpen"
+                  value={result.sharpen.applied ? `4× · ${(result.sharpen.durationMs / 1000).toFixed(1)} s` : `Skipped — ${result.sharpen.reason ?? 'not available'}`}
+                />
+              )}
+              <Row
+                label="Edges / arcs / circles"
+                value={`${result.stats.primitives.lines.toLocaleString()} / ${result.stats.primitives.arcs.toLocaleString()} / ${result.stats.primitives.circles.toLocaleString()}`}
+              />
               <Row label="Foreground" value={`${(result.foregroundRatio * 100).toFixed(1)}%`} />
               <Row label="Trace time" value={`${Math.round(result.durationMs)} ms`} />
               {svgBytes !== null && <Row label="SVG size" value={svgBytes > 1024 * 1024 ? `${(svgBytes / 1048576).toFixed(2)} MB` : `${(svgBytes / 1024).toFixed(1)} KB`} />}

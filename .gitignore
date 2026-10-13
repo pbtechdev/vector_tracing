@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# ML training
+.venv-ml
+ml/runs
+__pycache__

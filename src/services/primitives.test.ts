@@ -1,0 +1,232 @@
+import { describe, expect, it } from 'vitest'
+import type { Point, SubPath } from '../types/vectorTrace'
+import { sampleSubPath, settings, shapeRaster } from '../test/helpers'
+import { pointInPolygon } from './contourDetection'
+import { fitCircle } from './primitives'
+import { traceRaster } from './vectorization'
+
+const dist = (a: Point, b: Point): number => Math.hypot(a.x - b.x, a.y - b.y)
+const nodesOf = (p: SubPath): Point[] => [p.start, ...p.segments.map((s) => s.to)]
+
+function segDist(p: Point, a: Point, b: Point): number {
+  const dx = b.x - a.x
+  const dy = b.y - a.y
+  const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / (dx * dx + dy * dy)))
+  return Math.hypot(p.x - (a.x + dx * t), p.y - (a.y + dy * t))
+}
+
+/** Gear outline with trapezoid teeth: 4 vertices per tooth. */
+function gear(cx: number, cy: number, teeth: number, rootR: number, tipR: number, baseHalf: number, tipHalf: number, phase = 0.13): Point[] {
+  const pts: Point[] = []
+  const deg = Math.PI / 180
+  for (let k = 0; k < teeth; k++) {
+    const c = phase + (k / teeth) * Math.PI * 2
+    for (const [r, a] of [
+      [rootR, c - baseHalf * deg],
+      [tipR, c - tipHalf * deg],
+      [tipR, c + tipHalf * deg],
+      [rootR, c + baseHalf * deg],
+    ]) {
+      pts.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) })
+    }
+  }
+  return pts
+}
+
+/** Nodes where the outgoing direction turns by more than 20° (cusps / corners). */
+function sharpNodes(p: SubPath): number {
+  const nodes = nodesOf(p)
+  let count = 0
+  p.segments.forEach((s, k) => {
+    const next = p.segments[k + 1] ?? (p.closed ? p.segments[0] : null)
+    if (!next) return
+    const inDir = s.type === 'C' ? { x: s.to.x - s.c2.x, y: s.to.y - s.c2.y } : { x: s.to.x - nodes[k].x, y: s.to.y - nodes[k].y }
+    const outDir = next.type === 'C' ? { x: next.c1.x - s.to.x, y: next.c1.y - s.to.y } : { x: next.to.x - s.to.x, y: next.to.y - s.to.y }
+    const cos = (inDir.x * outDir.x + inDir.y * outDir.y) / (Math.hypot(inDir.x, inDir.y) * Math.hypot(outDir.x, outDir.y) || 1)
+    if (cos < Math.cos((20 * Math.PI) / 180)) count++
+  })
+  return count
+}
+
+/** Mask of a round-capped stroke along a parametric curve. */
+function strokeMask(w: number, h: number, curve: (t: number) => Point, halfWidth: number, steps = 3000): (x: number, y: number) => boolean {
+  const mask = new Uint8Array(w * h)
+  const r = Math.ceil(halfWidth) + 1
+  for (let i = 0; i <= steps; i++) {
+    const c = curve(i / steps)
+    for (let y = Math.floor(c.y - r); y <= c.y + r; y++) {
+      for (let x = Math.floor(c.x - r); x <= c.x + r; x++) {
+        if (x >= 0 && y >= 0 && x < w && y < h && Math.hypot(x + 0.5 - c.x, y + 0.5 - c.y) < halfWidth) mask[y * w + x] = 1
+      }
+    }
+  }
+  return (x, y) => mask[Math.floor(y) * w + Math.floor(x)] === 1
+}
+
+function trace(w: number, h: number, inside: (x: number, y: number) => boolean, mode: 'outline' | 'centerline' = 'outline', extra = {}) {
+  return traceRaster({ raster: shapeRaster(w, h, inside), sourceWidth: w, sourceHeight: h, settings: settings({ mode, ...extra }) })
+}
+
+describe('fitCircle', () => {
+  it('recovers centre and radius from noisy samples of a partial arc', () => {
+    const pts: Point[] = []
+    let seed = 7
+    const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647 - 0.5) * 0.6
+    for (let i = 0; i <= 40; i++) {
+      const a = 0.3 + (i / 40) * 2.2
+      pts.push({ x: 50 + 30 * Math.cos(a) + rnd(), y: 40 + 30 * Math.sin(a) + rnd() })
+    }
+    const c = fitCircle(pts)
+    expect(c).not.toBeNull()
+    expect(Math.abs(c!.cx - 50)).toBeLessThan(0.5)
+    expect(Math.abs(c!.cy - 40)).toBeLessThan(0.5)
+    expect(Math.abs(c!.r - 30)).toBeLessThan(0.3)
+  })
+
+  it('returns null for collinear points', () => {
+    expect(fitCircle([0, 1, 2, 3, 4].map((x) => ({ x, y: 2 * x })))).toBeNull()
+  })
+})
+
+describe('straight edges and corners', () => {
+  for (const [label, g] of [
+    ['large', gear(150, 150, 16, 80, 95, 7, 4)],
+    ['small', gear(110, 110, 24, 60, 70, 5, 2.5)],
+  ] as const) {
+    it(`traces ${label} trapezoid gear teeth with a sharp node at every vertex (outline)`, () => {
+      const size = label === 'large' ? 300 : 220
+      const result = trace(size, size, (x, y) => pointInPolygon({ x, y }, g))
+      const path = result.shapes[0].subpaths[0]
+      const nodes = nodesOf(path)
+      const misses = g.map((v) => Math.min(...nodes.map((n) => dist(n, v))))
+      // The small gear has 6 px tooth tops: sub-pixel vertices are not recoverable at that size.
+      expect(Math.max(...misses)).toBeLessThan(label === 'large' ? 1 : 1.5)
+      for (const p of sampleSubPath(path)) {
+        const d = Math.min(...g.map((v, i) => segDist(p, v, g[(i + 1) % g.length])))
+        expect(d).toBeLessThan(label === 'large' ? 0.8 : 1)
+      }
+      const lines = path.segments.filter((s) => s.type === 'L').length
+      expect(lines).toBeGreaterThanOrEqual(g.length * 0.9)
+      expect(path.segments.length).toBeLessThanOrEqual(g.length + 4)
+    })
+  }
+
+  it('traces gear teeth drawn as a stroke as trapezoids in centerline mode', () => {
+    const g = gear(150, 150, 16, 80, 100, 7, 4)
+    const onEdge = (x: number, y: number) => {
+      for (let i = 0; i < g.length; i++) if (segDist({ x, y }, g[i], g[(i + 1) % g.length]) < 2.5) return true
+      return false
+    }
+    const result = trace(300, 300, onEdge, 'centerline')
+    const closed = result.shapes.filter((s) => s.subpaths[0].closed)
+    expect(closed).toHaveLength(1)
+    const path = closed[0].subpaths[0]
+    const nodes = nodesOf(path)
+    const misses = g.map((v) => Math.min(...nodes.map((n) => dist(n, v))))
+    // The thinned skeleton itself only passes within ~1.9 px of these vertices.
+    expect(Math.max(...misses)).toBeLessThan(2)
+    for (const p of sampleSubPath(path)) {
+      const d = Math.min(...g.map((v, i) => segDist(p, v, g[(i + 1) % g.length])))
+      expect(d).toBeLessThan(1.5)
+    }
+    expect(path.segments.filter((s) => s.type === 'L').length).toBeGreaterThanOrEqual(g.length * 0.9)
+  })
+
+  it('falls back to the plain curve fit when straight edges and arcs are disabled', () => {
+    const g = gear(150, 150, 16, 80, 95, 7, 4)
+    const result = trace(300, 300, (x, y) => pointInPolygon({ x, y }, g), 'outline', { straightEdges: false, fitArcs: false })
+    expect(result.stats.primitives.lines).toBe(0)
+  })
+})
+
+describe('circles and arcs', () => {
+  it('emits a gear bore as an exact circle (4 cubics)', () => {
+    const g = gear(150, 150, 16, 80, 95, 7, 4)
+    const result = trace(300, 300, (x, y) => pointInPolygon({ x, y }, g) && Math.hypot(x - 150, y - 150) > 30)
+    const shape = result.shapes[0]
+    expect(shape.subpaths).toHaveLength(2)
+    const bore = shape.subpaths[1]
+    expect(bore.segments).toHaveLength(4)
+    expect(bore.segments.every((s) => s.type === 'C')).toBe(true)
+    for (const p of sampleSubPath(bore)) expect(Math.abs(Math.hypot(p.x - 150, p.y - 150) - 30)).toBeLessThan(0.5)
+    expect(result.stats.primitives.circles).toBe(1)
+  })
+
+  it('fits rounded-rectangle fillets as arcs that join the edges tangentially', () => {
+    const r = 18
+    const inside = (x: number, y: number) => {
+      if (x < 40 || x > 220 || y < 40 || y > 160) return false
+      const qx = Math.min(Math.max(x, 40 + r), 220 - r)
+      const qy = Math.min(Math.max(y, 40 + r), 160 - r)
+      return Math.hypot(x - qx, y - qy) <= r
+    }
+    const result = trace(260, 200, inside)
+    const path = result.shapes[0].subpaths[0]
+    expect(result.stats.primitives.arcs).toBe(4)
+    expect(path.segments.filter((s) => s.type === 'L')).toHaveLength(4)
+    expect(path.segments).toHaveLength(8)
+    // Tangent continuity at every line → arc join.
+    let prev = path.start
+    path.segments.forEach((s, k) => {
+      const next = path.segments[(k + 1) % path.segments.length]
+      if (s.type === 'L' && next.type === 'C') {
+        const dir = { x: s.to.x - prev.x, y: s.to.y - prev.y }
+        const handle = { x: next.c1.x - s.to.x, y: next.c1.y - s.to.y }
+        const sin = Math.abs(dir.x * handle.y - dir.y * handle.x) / (Math.hypot(dir.x, dir.y) * Math.hypot(handle.x, handle.y))
+        expect(sin).toBeLessThan(0.05)
+      }
+      prev = s.to
+    })
+    for (const p of sampleSubPath(path)) {
+      const qx = Math.min(Math.max(p.x, 40 + r), 220 - r)
+      const qy = Math.min(Math.max(p.y, 40 + r), 160 - r)
+      const d = qx === p.x || qy === p.y ? Math.min(Math.abs(p.x - 40), Math.abs(p.x - 220), Math.abs(p.y - 40), Math.abs(p.y - 160)) : Math.abs(Math.hypot(p.x - qx, p.y - qy) - r)
+      expect(d).toBeLessThan(0.8)
+    }
+  })
+
+  it('keeps small circles round instead of polygonising them', () => {
+    const result = trace(60, 60, (x, y) => Math.hypot(x - 30, y - 30) < 6)
+    const path = result.shapes[0].subpaths[0]
+    expect(path.segments.every((s) => s.type === 'C')).toBe(true)
+    for (const p of sampleSubPath(path)) expect(Math.abs(Math.hypot(p.x - 30, p.y - 30) - 6)).toBeLessThan(0.6)
+  })
+
+  it('does not add corners to smooth hand-drawn strokes', () => {
+    const curve = (t: number): Point => {
+      const a = t * Math.PI * 2
+      return { x: 150 + 110 * Math.sin(a), y: 100 + 60 * Math.sin(2 * a + 0.4) }
+    }
+    const stroke = strokeMask(300, 200, curve, 2.5)
+    for (const mode of ['centerline', 'outline'] as const) {
+      const sharp = (on: boolean) =>
+        trace(300, 200, stroke, mode, { straightEdges: on, fitArcs: on })
+          .shapes.flatMap((s) => s.subpaths)
+          .reduce((n, p) => n + sharpNodes(p), 0)
+      expect(sharp(true), mode).toBeLessThanOrEqual(sharp(false))
+    }
+    // A thin wavy band keeps only its four end corners.
+    const wave = trace(300, 120, (x, y) => x > 20 && x < 280 && Math.abs(y - (60 + 15 * Math.sin(x / 12))) < 4)
+    expect(wave.shapes.flatMap((s) => s.subpaths).reduce((n, p) => n + sharpNodes(p), 0)).toBeLessThanOrEqual(4)
+  })
+
+  it('does not turn an ellipse into corners', () => {
+    const result = trace(240, 160, (x, y) => ((x - 120) / 90) ** 2 + ((y - 80) / 45) ** 2 < 1)
+    const path = result.shapes[0].subpaths[0]
+    expect(result.stats.primitives.lines).toBe(0)
+    // Every node is smooth: the incoming and outgoing directions agree.
+    const nodes = nodesOf(path)
+    path.segments.forEach((s, k) => {
+      const next = path.segments[(k + 1) % path.segments.length]
+      const from = nodes[k]
+      const inDir = s.type === 'C' ? { x: s.to.x - s.c2.x, y: s.to.y - s.c2.y } : { x: s.to.x - from.x, y: s.to.y - from.y }
+      const outDir = next.type === 'C' ? { x: next.c1.x - s.to.x, y: next.c1.y - s.to.y } : { x: next.to.x - s.to.x, y: next.to.y - s.to.y }
+      const cos = (inDir.x * outDir.x + inDir.y * outDir.y) / (Math.hypot(inDir.x, inDir.y) * Math.hypot(outDir.x, outDir.y))
+      expect(cos).toBeGreaterThan(Math.cos((20 * Math.PI) / 180))
+    })
+    for (const p of sampleSubPath(path)) {
+      const e = Math.hypot((p.x - 120) / 90, (p.y - 80) / 45)
+      expect(Math.abs(e - 1) * 45).toBeLessThan(1.2)
+    }
+  })
+})

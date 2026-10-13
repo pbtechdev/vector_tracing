@@ -1,4 +1,5 @@
 import type { PathSegment, Point, SubPath } from '../types/vectorTrace'
+import { type PrimitiveCounts, type PrimitiveOptions, fitPrimitives } from './primitives'
 
 export interface Polyline {
   points: Point[]
@@ -406,6 +407,8 @@ export function fitBezierPath(
   corners: number[],
   tolerance: number,
   smoothBreaks: number[] = [],
+  /** Open paths only: forced unit tangents (direction of travel) at the first/last point. */
+  endTangents: { start?: Point | null; end?: Point | null } = {},
 ): SubPath | null {
   const n = points.length
   if (n < 2) return null
@@ -447,7 +450,9 @@ export function fitBezierPath(
       const a = cuts[k]
       const b = cuts[k + 1]
       if (b <= a) continue
-      fitCubic(points, a, b, startTangent(points, a, b, a), finishTangent(points, b, a, b), errSq, beziers, 0)
+      const t1 = a === 0 && endTangents.start ? endTangents.start : startTangent(points, a, b, a)
+      const t2 = b === n - 1 && endTangents.end ? scale(endTangents.end, -1) : finishTangent(points, b, a, b)
+      fitCubic(points, a, b, t1, t2, errSq, beziers, 0)
     }
   }
   if (beziers.length === 0) return null
@@ -470,6 +475,37 @@ export interface CurveOptions {
   pinnedAreCorners?: boolean
   /** Light smoothing iterations applied before corner detection (for jittery skeleton input). */
   presmooth?: number
+  /** Detect straight edges / circular arcs before free-form fitting. */
+  geometry?: GeometryOptions
+}
+
+export interface GeometryOptions {
+  lines: boolean
+  arcs: boolean
+  /** Processing pixels per source pixel (≥ 1). */
+  upscale: number
+  /** Half the stroke width for centerlines; 0 for contours. */
+  strokeRadius: number
+  counts?: PrimitiveCounts
+}
+
+function primitiveOptions(opts: CurveOptions, g: GeometryOptions): PrimitiveOptions {
+  const u = g.upscale
+  const r = g.strokeRadius
+  return {
+    lines: g.lines,
+    arcs: g.arcs,
+    tolerance: Math.max(0.6 * u, 0.6 + 0.12 * r),
+    minLength: Math.max(3.5 * u, 1.2 * r),
+    maxGap: Math.max(5 * u, 2.5 * r),
+    minRadius: Math.max(1.5 * u, 0.5 * r),
+    endTrim: r,
+    smoothing: opts.smoothing,
+    presmooth: opts.presmooth ?? 0,
+    cornerAngle: opts.cornerAngle,
+    curveTolerance: opts.tolerance,
+    pinnedAreCorners: opts.pinnedAreCorners ?? true,
+  }
 }
 
 /**
@@ -479,6 +515,12 @@ export interface CurveOptions {
 export function polylineToPath(line: Polyline, closed: boolean, opts: CurveOptions): SubPath | null {
   const pinnedAreCorners = opts.pinnedAreCorners ?? true
   let sampled = resample(line, opts.spacing, closed)
+  const g = opts.geometry
+  if (g && (g.lines || g.arcs)) {
+    // Primitives are found on the raw samples: pre-smoothing would round the corners they restore.
+    const path = fitPrimitives(sampled, closed, primitiveOptions(opts, g), g.counts)
+    if (path) return path
+  }
   if (opts.presmooth) sampled = taubinSmooth(sampled, opts.presmooth, closed)
   const corners = detectCorners(sampled, closed, opts.cornerAngle, 2, 2, pinnedAreCorners)
   const pinned = [...sampled.pinned]

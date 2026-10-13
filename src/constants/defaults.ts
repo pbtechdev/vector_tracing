@@ -19,6 +19,9 @@ export const DEFAULT_TRACE_SETTINGS: TraceSettings = {
   joinStrokes: true,
   joinAngle: 40,
   gapClosing: 0,
+  straightEdges: true,
+  fitArcs: true,
+  aiSharpen: false,
 }
 
 export const DEFAULT_EXPORT_SETTINGS: ExportSettings = {

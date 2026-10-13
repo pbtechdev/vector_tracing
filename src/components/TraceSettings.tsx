@@ -201,6 +201,30 @@ export function TraceSettings({
         />
       </Section>
 
+      <Section title="AI">
+        <Toggle
+          label="AI sharpen (small or blurry images)"
+          checked={settings.aiSharpen}
+          onChange={(v) => onChange({ aiSharpen: v })}
+          hint="Rebuilds text and fine detail at 4× with a neural network that runs on this device. Slower; used for images up to about 1200 px."
+        />
+      </Section>
+
+      <Section title="Geometry">
+        <Toggle
+          label="Detect straight edges & corners"
+          checked={settings.straightEdges}
+          onChange={(v) => onChange({ straightEdges: v })}
+          hint="Keeps gear teeth, polygons and mechanical parts sharp, even at obtuse corners."
+        />
+        <Toggle
+          label="Fit circles & arcs"
+          checked={settings.fitArcs}
+          onChange={(v) => onChange({ fitArcs: v })}
+          hint="Exact circles for holes, bores and fillets. Turn both off for organic artwork."
+        />
+      </Section>
+
       <Section title="Image adjustments">
         <Toggle label="Invert colors" checked={settings.invert} onChange={(v) => onChange({ invert: v })} hint="Trace light shapes on a dark background." />
         <Toggle

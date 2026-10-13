@@ -40,6 +40,21 @@ export interface TraceSettings {
   joinAngle: number
   /** Centerline: bridge gaps up to this length (source px) between aligned line ends. 0 = off. */
   gapClosing: number
+  /** Fit straight edges and put sharp corners where they meet (gear teeth, polygons). */
+  straightEdges: boolean
+  /** Fit exact circles and circular arcs (holes, bores, fillets). */
+  fitArcs: boolean
+  /** Rebuild small or blurry images at 4× with the bundled neural sharpener before tracing. */
+  aiSharpen: boolean
+}
+
+export interface SharpenInfo {
+  applied: boolean
+  /** Why sharpening was not applied. */
+  reason?: string
+  durationMs: number
+  tiles: number
+  skippedTiles: number
 }
 
 /**
@@ -73,6 +88,8 @@ export interface TraceStats {
   nodeCount: number
   curveCount: number
   lineCount: number
+  /** Detected geometric primitives (straight edges, arcs, full circles). */
+  primitives: { lines: number; arcs: number; circles: number }
 }
 
 export interface TraceResult {
@@ -93,6 +110,8 @@ export interface TraceResult {
   bitmap: Uint8Array
   durationMs: number
   warnings: string[]
+  /** Present when AI sharpening was requested. */
+  sharpen?: SharpenInfo
 }
 
 export type FillStyle = 'fill' | 'stroke' | 'fill-stroke'
@@ -133,6 +152,10 @@ export type WorkerRequest = {
   sourceWidth: number
   sourceHeight: number
   settings: TraceSettings
+  /** The raster is at sharpener input size and must be sharpened 4× before tracing. */
+  sharpen: boolean
+  /** Set when sharpening was requested but not possible for this image. */
+  sharpenSkipped?: string
 }
 
 export type WorkerResponse =

@@ -19,6 +19,8 @@ export interface TraceJob {
   sourceWidth: number
   sourceHeight: number
   settings: TraceSettings
+  sharpen?: boolean
+  sharpenSkipped?: string
 }
 
 /**
@@ -73,6 +75,8 @@ export class TraceClient {
           sourceWidth: job.sourceWidth,
           sourceHeight: job.sourceHeight,
           settings: job.settings,
+          sharpen: job.sharpen ?? false,
+          sharpenSkipped: job.sharpenSkipped,
         },
         [data.buffer],
       )

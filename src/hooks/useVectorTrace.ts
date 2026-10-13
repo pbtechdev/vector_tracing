@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { computeProcessingSize, rasterize } from '../services/imageLoader'
+import { sharpenInputSize } from '../services/inkSharpener'
 import { TraceCancelledError, TraceClient } from '../services/traceClient'
 import type { RasterInput, TraceProgress, TraceResult, TraceSettings } from '../types/vectorTrace'
 import type { UploadedImage } from './useImageUpload'
@@ -9,6 +10,7 @@ export type TraceStatus = 'idle' | 'tracing' | 'done' | 'error'
 interface RasterCache {
   image: UploadedImage
   maxSide: number
+  sharpen: boolean
   raster: RasterInput
 }
 
@@ -45,12 +47,12 @@ export function useVectorTrace(image: UploadedImage | null) {
     cacheRef.current = null
   }, [image])
 
-  const getRaster = useCallback((img: UploadedImage, maxSide: number): RasterInput => {
+  const getRaster = useCallback((img: UploadedImage, maxSide: number, sharpen: boolean): RasterInput => {
     const cached = cacheRef.current
-    if (cached && cached.image === img && cached.maxSide === maxSide) return cached.raster
-    const size = computeProcessingSize(img.width, img.height, maxSide)
+    if (cached && cached.image === img && cached.maxSide === maxSide && cached.sharpen === sharpen) return cached.raster
+    const size = sharpen ? sharpenInputSize(img.width, img.height, maxSide)! : computeProcessingSize(img.width, img.height, maxSide)
     const raster = rasterize(img.bitmap, size.width, size.height)
-    cacheRef.current = { image: img, maxSide, raster }
+    cacheRef.current = { image: img, maxSide, sharpen, raster }
     return raster
   }, [])
 
@@ -66,9 +68,11 @@ export function useVectorTrace(image: UploadedImage | null) {
         // Yield so the loading state paints before rasterizing on the main thread.
         await new Promise((r) => setTimeout(r, 0))
         if (requestId !== requestRef.current) return
-        const raster = getRaster(image, settings.maxProcessingSize)
+        const sharpen = settings.aiSharpen && sharpenInputSize(image.width, image.height, settings.maxProcessingSize) !== null
+        const sharpenSkipped = settings.aiSharpen && !sharpen ? 'The image is already high-resolution.' : undefined
+        const raster = getRaster(image, settings.maxProcessingSize, sharpen)
         const res = await client.trace(
-          { raster, sourceWidth: image.width, sourceHeight: image.height, settings },
+          { raster, sourceWidth: image.width, sourceHeight: image.height, settings, sharpen, sharpenSkipped },
           (p) => {
             if (requestId === requestRef.current) setProgress(p)
           },
